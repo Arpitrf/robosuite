@@ -8,34 +8,38 @@ from robosuite.models.arenas import WipeArena
 from robosuite.models.tasks import ManipulationTask
 from robosuite.utils.observables import Observable, sensor
 
+from scipy.fftpack import fft
+from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
+
 # Default Wipe environment configuration
 DEFAULT_WIPE_CONFIG = {
     # settings for reward
-    "arm_limit_collision_penalty": -10.0,  # penalty for reaching joint limit or arm collision (except the wiping tool) with the table
+    "arm_limit_collision_penalty": -10.0,  # penalty for reaching joint limit or arm collision (except the wiping tool) with the table (originally -10.0)
     "wipe_contact_reward": 0.01,  # reward for contacting something with the wiping tool
     "unit_wiped_reward": 50.0,  # reward per peg wiped
     "ee_accel_penalty": 0,  # penalty for large end-effector accelerations
-    "excess_force_penalty_mul": 0.05,  # penalty for each step that the force is over the safety threshold
+    "excess_force_penalty_mul": 0.05,  # penalty for each step that the force is over the safety threshold (0.05 originally)
     "distance_multiplier": 5.0,  # multiplier for the dense reward inversely proportional to the mean location of the pegs to wipe
     "distance_th_multiplier": 5.0,  # multiplier in the tanh function for the aforementioned reward
     # settings for table top
     "table_full_size": [0.5, 0.8, 0.05],  # Size of tabletop
     "table_offset": [0.15, 0, 0.9],  # Offset of table (z dimension defines max height of table)
-    "table_friction": [0.03, 0.005, 0.0001],  # Friction parameters for the table
+    "table_friction": [1.0, 0.1, 0.01],  # Friction parameters for the table (originally [0.03, 0.005, 0.0001])
     "table_friction_std": 0,  # Standard deviation to sample different friction parameters for the table each episode
     "table_height": 0.0,  # Additional height of the table over the default location
     "table_height_std": 0.0,  # Standard deviation to sample different heigths of the table each episode
     "line_width": 0.04,  # Width of the line to wipe (diameter of the pegs)
     "two_clusters": False,  # if the dirt to wipe is one continuous line or two
     "coverage_factor": 0.6,  # how much of the table surface we cover
-    "num_markers": 100,  # How many particles of dirt to generate in the environment
+    "num_markers": 100,  # How many particles of dirt to generate in the environment (originally 100)
     # settings for thresholds
     "contact_threshold": 1.0,  # Minimum eef force to qualify as contact [N]
     "pressure_threshold": 0.5,  # force threshold (N) to overcome to get increased contact wiping reward
     "pressure_threshold_max": 60.0,  # maximum force allowed (N)
     # misc settings
-    "print_results": False,  # Whether to print results or not
-    "get_info": False,  # Whether to grab info after each env step if not
+    "print_results": True,  # Whether to print results or not
+    "get_info": True,  # Whether to grab info after each env step if not
     "use_robot_obs": True,  # if we use robot observations (proprioception) as input to the policy
     "use_contact_obs": True,  # if we use a binary observation for whether robot is in contact or not
     "early_terminations": True,  # Whether we allow for early terminations or not
@@ -195,9 +199,9 @@ class Wipe(ManipulationEnv):
         renderer_config=None,
     ):
         # Assert that the gripper type is None
-        assert (
-            gripper_types == "WipingGripper"
-        ), "Tried to specify gripper other than WipingGripper in Wipe environment!"
+        # assert (
+        #     gripper_types == "WipingGripper"
+        # ), "Tried to specify gripper other than WipingGripper in Wipe environment!"
 
         # Get config
         self.task_config = task_config if task_config is not None else DEFAULT_WIPE_CONFIG
@@ -249,6 +253,15 @@ class Wipe(ManipulationEnv):
         self.early_terminations = self.task_config["early_terminations"]
         self.use_condensed_obj_obs = self.task_config["use_condensed_obj_obs"]
 
+        # settings added for tuli project
+        self.force_history_horizon = 30
+        self.extended_action_step_size = 30
+        self.force_history = []
+        self.all_peak_freqs = []
+        self.contact_history = []
+        self.ideal_peak_freq = 0.4
+        self.peak_freq_tolerance = 0.1
+
         # Scale reward if desired (see reward method for details)
         self.reward_normalization_factor = horizon / (
             self.num_markers * self.unit_wiped_reward + horizon * (self.wipe_contact_reward + self.task_complete_reward)
@@ -263,6 +276,13 @@ class Wipe(ManipulationEnv):
 
         # whether to include and use ground-truth object states
         self.use_object_obs = use_object_obs
+
+        # Parameters for wiping skill
+        self.contact_force_threshold = 1.0  # N
+        self.lateral_step_size = 0.5  # 1cm per step #0.05
+        self.vertical_step_size = 3.0  # 0.5cm per step
+        self.max_steps_without_contact = 500  # Maximum steps to try reaching contact
+
 
         super().__init__(
             robots=robots,
@@ -296,84 +316,255 @@ class Wipe(ManipulationEnv):
         self.ee_force_bias = {arm: np.zeros(3) for arm in self.robots[0].arms}
         self.ee_torque_bias = {arm: np.zeros(3) for arm in self.robots[0].arms}
 
+    # TODO: Implement this method
     def _get_active_markers(self, c_geoms):
-        """
-        Get the markers that are currently being wiped by the tool
+        return self.model.mujoco_arena.markers
+    
+    # def _get_active_markers(self, c_geoms):
+    #     """
+    #     Get the markers that are currently being wiped by the tool
 
-        Args:
-            c_geoms (list): List of corner geoms for the tool
+    #     Args:
+    #         c_geoms (list): List of corner geoms for the tool
 
-        Returns:
-            list: List of active markers
-        """
-        active_markers = []
-        corner1_id = self.sim.model.geom_name2id(c_geoms[0])
-        corner1_pos = np.array(self.sim.data.geom_xpos[corner1_id])
-        corner2_id = self.sim.model.geom_name2id(c_geoms[1])
-        corner2_pos = np.array(self.sim.data.geom_xpos[corner2_id])
-        corner3_id = self.sim.model.geom_name2id(c_geoms[2])
-        corner3_pos = np.array(self.sim.data.geom_xpos[corner3_id])
-        corner4_id = self.sim.model.geom_name2id(c_geoms[3])
-        corner4_pos = np.array(self.sim.data.geom_xpos[corner4_id])
+    #     Returns:
+    #         list: List of active markers
+    #     """
+    #     active_markers = []
+    #     corner1_id = self.sim.model.geom_name2id(c_geoms[0])
+    #     corner1_pos = np.array(self.sim.data.geom_xpos[corner1_id])
+    #     corner2_id = self.sim.model.geom_name2id(c_geoms[1])
+    #     corner2_pos = np.array(self.sim.data.geom_xpos[corner2_id])
+    #     corner3_id = self.sim.model.geom_name2id(c_geoms[2])
+    #     corner3_pos = np.array(self.sim.data.geom_xpos[corner3_id])
+    #     corner4_id = self.sim.model.geom_name2id(c_geoms[3])
+    #     corner4_pos = np.array(self.sim.data.geom_xpos[corner4_id])
 
-        # Unit vectors on my plane
-        v1 = corner1_pos - corner2_pos
-        v1 /= np.linalg.norm(v1)
-        v2 = corner4_pos - corner2_pos
-        v2 /= np.linalg.norm(v2)
+    #     # Unit vectors on my plane
+    #     v1 = corner1_pos - corner2_pos
+    #     v1 /= np.linalg.norm(v1)
+    #     v2 = corner4_pos - corner2_pos
+    #     v2 /= np.linalg.norm(v2)
 
-        # Corners of the tool in the coordinate frame of the plane
-        t1 = np.array([np.dot(corner1_pos - corner2_pos, v1), np.dot(corner1_pos - corner2_pos, v2)])
-        t2 = np.array([np.dot(corner2_pos - corner2_pos, v1), np.dot(corner2_pos - corner2_pos, v2)])
-        t3 = np.array([np.dot(corner3_pos - corner2_pos, v1), np.dot(corner3_pos - corner2_pos, v2)])
-        t4 = np.array([np.dot(corner4_pos - corner2_pos, v1), np.dot(corner4_pos - corner2_pos, v2)])
+    #     # Corners of the tool in the coordinate frame of the plane
+    #     t1 = np.array([np.dot(corner1_pos - corner2_pos, v1), np.dot(corner1_pos - corner2_pos, v2)])
+    #     t2 = np.array([np.dot(corner2_pos - corner2_pos, v1), np.dot(corner2_pos - corner2_pos, v2)])
+    #     t3 = np.array([np.dot(corner3_pos - corner2_pos, v1), np.dot(corner3_pos - corner2_pos, v2)])
+    #     t4 = np.array([np.dot(corner4_pos - corner2_pos, v1), np.dot(corner4_pos - corner2_pos, v2)])
 
-        pp = [t1, t2, t4, t3]
+    #     pp = [t1, t2, t4, t3]
 
-        # Normal of the plane defined by v1 and v2
-        n = np.cross(v1, v2)
-        n /= np.linalg.norm(n)
+    #     # Normal of the plane defined by v1 and v2
+    #     n = np.cross(v1, v2)
+    #     n /= np.linalg.norm(n)
 
-        def isLeft(P0, P1, P2):
-            return (P1[0] - P0[0]) * (P2[1] - P0[1]) - (P2[0] - P0[0]) * (P1[1] - P0[1])
+    #     def isLeft(P0, P1, P2):
+    #         return (P1[0] - P0[0]) * (P2[1] - P0[1]) - (P2[0] - P0[0]) * (P1[1] - P0[1])
 
-        def PointInRectangle(X, Y, Z, W, P):
-            return isLeft(X, Y, P) < 0 and isLeft(Y, Z, P) < 0 and isLeft(Z, W, P) < 0 and isLeft(W, X, P) < 0
+    #     def PointInRectangle(X, Y, Z, W, P):
+    #         return isLeft(X, Y, P) < 0 and isLeft(Y, Z, P) < 0 and isLeft(Z, W, P) < 0 and isLeft(W, X, P) < 0
 
-        # Only go into this computation if there are contact points
-        if self.sim.data.ncon != 0:
+    #     # Only go into this computation if there are contact points
+    #     if self.sim.data.ncon != 0:
 
-            # Check each marker that is still active
-            for marker in self.model.mujoco_arena.markers:
+    #         # Check each marker that is still active
+    #         for marker in self.model.mujoco_arena.markers:
 
-                # Current marker 3D location in world frame
-                marker_pos = np.array(self.sim.data.body_xpos[self.sim.model.body_name2id(marker.root_body)])
+    #             # Current marker 3D location in world frame
+    #             marker_pos = np.array(self.sim.data.body_xpos[self.sim.model.body_name2id(marker.root_body)])
 
-                # We use the second tool corner as point on the plane and define the vector connecting
-                # the marker position to that point
-                v = marker_pos - corner2_pos
+    #             # We use the second tool corner as point on the plane and define the vector connecting
+    #             # the marker position to that point
+    #             v = marker_pos - corner2_pos
 
-                # Shortest distance between the center of the marker and the plane
-                dist = np.dot(v, n)
+    #             # Shortest distance between the center of the marker and the plane
+    #             dist = np.dot(v, n)
 
-                # Projection of the center of the marker onto the plane
-                projected_point = np.array(marker_pos) - dist * n
+    #             # Projection of the center of the marker onto the plane
+    #             projected_point = np.array(marker_pos) - dist * n
 
-                # Positive distances means the center of the marker is over the plane
-                # The plane is aligned with the bottom of the wiper and pointing up, so the marker would be over it
-                if dist > 0.0:
-                    # Distance smaller than this threshold means we are close to the plane on the upper part
-                    if dist < 0.02:
-                        # Write touching points and projected point in coordinates of the plane
-                        pp_2 = np.array(
-                            [np.dot(projected_point - corner2_pos, v1), np.dot(projected_point - corner2_pos, v2)]
-                        )
-                        # Check if marker is within the tool center:
-                        if PointInRectangle(pp[0], pp[1], pp[2], pp[3], pp_2):
-                            active_markers.append(marker)
-        return active_markers
+    #             # Positive distances means the center of the marker is over the plane
+    #             # The plane is aligned with the bottom of the wiper and pointing up, so the marker would be over it
+    #             if dist > 0.0:
+    #                 # Distance smaller than this threshold means we are close to the plane on the upper part
+    #                 if dist < 0.02:
+    #                     # Write touching points and projected point in coordinates of the plane
+    #                     pp_2 = np.array(
+    #                         [np.dot(projected_point - corner2_pos, v1), np.dot(projected_point - corner2_pos, v2)]
+    #                     )
+    #                     # Check if marker is within the tool center:
+    #                     if PointInRectangle(pp[0], pp[1], pp[2], pp[3], pp_2):
+    #                         active_markers.append(marker)
+    #     return active_markers
 
     def reward(self, action=None):
+        reward = 0
+        ee_force = np.linalg.norm(self.robots[0].ee_force["right"])
+        
+        self.force_history.append(ee_force)
+        gripper_contact = self._has_gripper_contact
+        any_contact = self._check_contact()
+        self.contact_history.append(any_contact)
+        print("any_contact: ", any_contact)
+        
+        start_idx = self.timestep - self.force_history_horizon
+        peaks = []
+        peak_freqs = []
+        # only compute FFT if we have enough force history
+        # if start_idx >= 0 and self.timestep % self.extended_action_step_size == 0:
+        if start_idx >= 0:
+            # return 0
+            force_values = np.array(self.force_history[start_idx:])
+
+            # Compute FFT
+            N = self.force_history_horizon
+            freqs = np.fft.fftfreq(N, d=1)  # Frequency axis
+            
+            # # ===== General FFT method =====
+            # fft_values = np.abs(fft(force_values))  # Magnitude of FFT
+            # # Find peaks in the frequency domain
+            # peaks, _ = find_peaks(fft_values, height=0.1 * max(fft_values))
+            # # ==============================
+
+            # ===== Welch's method =====
+            # Welch's method
+            from scipy.signal import welch, find_peaks
+            dt = 1 / self.control_freq
+            fs = 1.0 / dt
+            # use nperseg about the window length, maybe N or N//2
+            f, Pxx = welch(force_values, fs=fs, window='hann', nperseg=min(N, 256))
+
+            # detect peaks in PSD (Pxx)
+            noise_floor = np.median(Pxx) + 3 * np.std(Pxx)  # tune factor
+            peaks, props = find_peaks(Pxx, height=noise_floor, prominence=noise_floor*0.5)
+            # ==============================
+            
+            peak_freqs = freqs[peaks]
+            self.all_peak_freqs.append(peak_freqs)
+            # print("peak_freqs: ", peak_freqs)
+            # breakpoint()
+        else:
+            self.all_peak_freqs.append([])
+
+        # # Plot time-domain signal
+        # plt.figure(figsize=(12,5))
+        # plt.subplot(2,1,1)
+        # plt.plot(force_values)
+        # plt.title("Force Data (Time Domain)")
+        # plt.xlabel("Sample Index")
+        # plt.ylabel("Force")
+
+        # # Plot frequency spectrum
+        # plt.subplot(2,1,2)
+        # plt.plot(freqs[:N//2], fft_values[:N//2])  # Only positive frequencies
+        # plt.scatter(freqs[peaks], fft_values[peaks], color='red', label="Peaks")
+        # plt.title("Frequency Spectrum")
+        # plt.xlabel("Frequency (Hz)")
+        # plt.ylabel("Magnitude")
+        # plt.legend()
+        # plt.show()
+
+        reward = 0.0
+        if self.check_contact(self.robots[0].robot_model):
+            if self.reward_shaping:
+                reward = self.arm_limit_collision_penalty
+            self.collisions += 1
+        elif self.robots[0].check_q_limits():
+            if self.reward_shaping:
+                reward = self.arm_limit_collision_penalty
+            self.collisions += 1
+        # Penalty for excessive force with the end-effector
+        elif ee_force > 500:
+                # reward = -(self.excess_force_penalty_mul * ee_force)
+                reward = self.arm_limit_collision_penalty
+                self.f_excess += 1
+        elif len(peak_freqs) > 0:
+            for peak_freq in peak_freqs:
+                print("peak_freq: ", peak_freq)
+                if abs(peak_freq - self.ideal_peak_freq) < self.peak_freq_tolerance:
+                    # breakpoint()
+                    reward = 5.0
+                    break
+
+        # If the arm is not colliding or in joint limits, we check if we are wiping
+        # (we don't want to reward wiping if there are unsafe situations)
+        active_markers = []
+
+        # Current 3D location of the corners of the wiping tool in world frame
+        for arm in self.robots[0].arms:
+            c_geoms = self.robots[0].gripper[arm].important_geoms["corners"]
+            active_markers += self._get_active_markers(c_geoms)
+
+        # Obtain the list of currently active (wiped) markers that where not wiped before
+        # These are the markers we are wiping at this step
+        lall = np.where(np.isin(active_markers, self.wiped_markers, invert=True))
+        new_active_markers = np.array(active_markers)[lall]
+
+        # Loop through all new markers we are wiping at this step
+        for new_active_marker in new_active_markers:
+            # Grab relevant marker id info
+            new_active_marker_geom_id = self.sim.model.geom_name2id(new_active_marker.visual_geoms[0])
+            # Make this marker transparent since we wiped it (alpha = 0)
+            self.sim.model.geom_rgba[new_active_marker_geom_id][3] = 0
+            # Add this marker the wiped list
+            self.wiped_markers.append(new_active_marker)
+
+        return reward
+    
+    def reward_force_and_motion(self, action=None):
+        """
+        Sensory Reward function for the task.
+        """
+        reward = 0
+
+        ee_vel = np.linalg.norm(self.robots[0]._hand_total_velocity["right"][:3])
+        ee_force = np.linalg.norm(self.robots[0].ee_force["right"])
+
+        ee_vel_th = 0.1
+        ee_force_min_th = 2.0
+
+        if self.check_contact(self.robots[0].robot_model):
+            if self.reward_shaping:
+                reward = self.arm_limit_collision_penalty
+            self.collisions += 1
+        elif self.robots[0].check_q_limits():
+            if self.reward_shaping:
+                reward = self.arm_limit_collision_penalty
+            self.collisions += 1
+        # Penalty for excessive force with the end-effector
+        elif ee_force > 300:
+                reward = -(self.excess_force_penalty_mul * ee_force)
+                self.f_excess += 1
+        elif ee_vel > ee_vel_th and ee_force > ee_force_min_th:
+                reward = 5.0
+
+        # If the arm is not colliding or in joint limits, we check if we are wiping
+        # (we don't want to reward wiping if there are unsafe situations)
+        active_markers = []
+
+        # Current 3D location of the corners of the wiping tool in world frame
+        for arm in self.robots[0].arms:
+            c_geoms = self.robots[0].gripper[arm].important_geoms["corners"]
+            active_markers += self._get_active_markers(c_geoms)
+
+        # Obtain the list of currently active (wiped) markers that where not wiped before
+        # These are the markers we are wiping at this step
+        lall = np.where(np.isin(active_markers, self.wiped_markers, invert=True))
+        new_active_markers = np.array(active_markers)[lall]
+
+        # Loop through all new markers we are wiping at this step
+        for new_active_marker in new_active_markers:
+            # Grab relevant marker id info
+            new_active_marker_geom_id = self.sim.model.geom_name2id(new_active_marker.visual_geoms[0])
+            # Make this marker transparent since we wiped it (alpha = 0)
+            self.sim.model.geom_rgba[new_active_marker_geom_id][3] = 0
+            # Add this marker the wiped list
+            self.wiped_markers.append(new_active_marker)
+        
+        return reward
+
+    
+    def old_reward(self, action=None):
         """
         Reward function for the task.
 
@@ -505,13 +696,21 @@ class Wipe(ManipulationEnv):
             )
             print(string_to_print)
 
+        unnormalized_reward = reward
         # If we're scaling our reward, we normalize the per-step rewards given the theoretical best episode return
         # This is equivalent to scaling the reward by:
         #   reward_scale * (horizon /
         #       (num_markers * unit_wiped_reward + horizon * (wipe_contact_reward + task_complete_reward)))
         if self.reward_scale:
             reward *= self.reward_scale * self.reward_normalization_factor
+        # if len(new_active_markers) > 0:
+        #         breakpoint()
+        # if reward > 0:
+        #     breakpoint()
         return reward
+    
+    def get_amount_wiped(self):
+        return len(self.wiped_markers) / self.num_markers
 
     def _load_model(self):
         """
@@ -742,6 +941,9 @@ class Wipe(ManipulationEnv):
         """
         reward, done, info = super()._post_action(action)
 
+        amount_wiped = self.get_amount_wiped()
+        info["amount_wiped"] = amount_wiped
+
         # Update force bias
         if all([np.linalg.norm(self.ee_force_bias[arm]) == 0 for arm in self.ee_force_bias]):
             self.ee_force_bias = self.robots[0].ee_force
@@ -808,9 +1010,191 @@ class Wipe(ManipulationEnv):
         Returns:
             bool: True if contact is surpasses given threshold magnitude
         """
+        arm = self.robots[0].arms[0]
+        # print(f"ee_force: {np.linalg.norm(self.robots[0].ee_force[arm] - self.ee_force_bias[arm])}")
         return any(
-            [
+            [   
                 np.linalg.norm(self.robots[0].ee_force[arm] - self.ee_force_bias[arm]) > self.contact_threshold
                 for arm in self.robots[0].arms
             ]
         )
+    
+    def reset(self):
+        """
+        Extends the superclass reset method to reset the force history list.
+        """
+        self.force_history = []
+        return super().reset()
+
+    def _check_contact(self):
+        """Check if the robot's end effector is in contact with any surface"""
+        # print(f"ncon: {self.sim.data.ncon}")
+        return self.sim.data.ncon > 0
+
+    def _get_current_ee_position(self):
+        """Get the current end effector position"""
+        return self.robots[0]._hand_pose["right"][:3, 3]  # Just position, not orientation
+
+    def move_down_until_contact(self):
+        """Move the end effector down until contact is detected"""
+        steps_taken = 0
+        while not self._check_contact() and steps_taken < self.max_steps_without_contact:
+            # print("steps_taken, step, contact: ", steps_taken, self.timestep, self._check_contact())
+            current_pos = self._get_current_ee_position()
+            target_pos = current_pos.copy()
+            target_pos[2] -= self.vertical_step_size  # Move down in z-axis
+            
+            # Create action to move down
+            action = np.zeros(6)  # 6-DOF pose control + gripper
+            action[:3] = target_pos - current_pos
+            
+            # Take the action
+            # print(f"action: {action}")
+            obs, reward, done, info = self.step(action)
+            steps_taken += 1
+        
+        return self._check_contact()
+
+    def move_laterally_with_contact(self, direction='right', distance=0.5):
+        """
+        Move the end effector laterally while maintaining contact
+        direction: 'right' or 'left'
+        distance: distance to move in meters
+        """
+        # if not self._check_contact():
+        #     return False
+
+        # steps_needed = int(distance / self.lateral_step_size)
+        steps_needed = 80
+        direction_multiplier = 1 if direction == 'right' else -1
+        # print(f"steps_needed: {steps_needed}")
+        is_contact = self._check_contact()
+        print(f"is_contact: {is_contact}")
+        
+        init_pos = self._get_current_ee_position()
+        for curr_step in range(steps_needed):
+            current_pos = self._get_current_ee_position()
+            target_pos = current_pos.copy()
+            target_pos[1] += direction_multiplier * self.lateral_step_size  # Move in y-axis
+            
+            # # If we've lost contact, try to regain it by moving down slightly
+            # if not self._check_contact():
+            #     target_pos[2] -= self.vertical_step_size
+            
+            # Create action
+            action = np.zeros(6)  # 6-DOF pose control + gripper
+            action[:3] = target_pos - current_pos
+            print(f"action: {np.linalg.norm(action)}")
+
+            if curr_step % self.extended_action_step_size == 0:
+                # Add some noise to the x and y axis movement
+                xy_noise_scale = 0.0  # Standard deviation for x,y-axis noise in meters
+                z_noise_scale = 0.0  # Standard deviation for z-axis noise in meters
+                
+                noise = np.zeros(6)
+                x_noise = np.random.randn() * xy_noise_scale
+                y_noise = np.random.randn() * xy_noise_scale
+                # z noise should only be negative (or zero).
+                # We take a standard normal random number, scale it, and then ensure it's non-positive.
+                z_noise = min(0, np.random.randn() * z_noise_scale)
+                
+                # z_noise = -0.01
+                # np.random.randn() * z_noise_scale
+
+                noise[:3] = np.array([x_noise, y_noise, z_noise])
+
+                # # Add some noise to the rotation axis
+                # rotation_noise_scale = 0.1  # Standard deviation for rotational noise in radians
+                # action[3:] += np.random.randn(3) * rotation_noise_scale
+            
+            print(f"noise: {noise}")
+            action += noise
+
+            # Take the action
+            self.step(action)
+
+            new_pos = self._get_current_ee_position()
+            # print("action[:3], delta move: ", action[:3], np.linalg.norm(new_pos - current_pos))
+
+            gripper_contact = self._has_gripper_contact
+            # print(f"gripper_contact: {gripper_contact}")
+            
+            # print(f"is_contact: {self._check_contact()}")
+            # If we still don't have contact, the movement failed
+            # if not self._check_contact():
+            #     return False
+        final_pos = self._get_current_ee_position()
+        print("total_delta_move: ", np.linalg.norm(final_pos - init_pos))
+
+        return True
+
+    def perform_wiping_skill(self, num_cycles=5):
+        """
+        Perform the complete wiping skill:
+        1. Move down until contact
+        2. Move right and left while maintaining contact
+        3. Move up after completion
+        """
+        # First move down until contact
+        if not self.move_down_until_contact():
+            print("Failed to establish initial contact")
+            return False
+
+        # print("Starting lateral movement at step: ", self.timestep)
+        # breakpoint()
+        
+        # Perform the specified number of cycles
+        for cycle in range(num_cycles):
+            # Move right
+            if not self.move_laterally_with_contact('right', 40.0):
+                print(f"Failed during rightward movement in cycle {cycle + 1}")
+                return False
+                        
+            # # Move left
+            # if not self.move_laterally_with_contact('left', 40.0):
+            #     print(f"Failed during leftward movement in cycle {cycle + 1}")
+            #     return False
+
+        # breakpoint()
+        
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+        # Plot 1: Force History on ax1
+        ax1.plot(self.force_history)
+        ax1.set_title("Force History")
+        ax1.set_ylabel("End-effector Force (N)")
+        ax1.grid(True)
+        ax1.set_ylim(0, 10.0)
+
+        # Plot 2: Peak Frequencies on ax2
+        for t, freqs_at_t in enumerate(self.all_peak_freqs):
+            if len(freqs_at_t) > 0:
+                ax2.scatter([t] * len(freqs_at_t), freqs_at_t, c="b", marker="o")
+
+        ax2.set_xlabel("Time step")
+        ax2.set_ylabel("Peak frequency (Hz)")
+        ax2.set_title("Peak frequencies over time")
+
+        # Plot 3: Contact History on ax3
+        ax3.plot(self.contact_history)
+        ax3.set_title("Contact History")
+        ax3.set_ylabel("Contact (1) or No Contact (0)")
+        ax3.grid(True)
+        ax3.set_ylim(-0.1, 1.1)
+
+        # Adjust layout and show the combined plot
+        plt.tight_layout()
+        plt.show()
+
+        
+        # Move up after completion
+        current_pos = self._get_current_ee_position()
+        target_pos = current_pos.copy()
+        target_pos[2] += 0.1  # Move up 10cm
+        
+        action = np.zeros(6)
+        action[:3] = target_pos - current_pos
+        self.step(action)
+        
+        return True
+
